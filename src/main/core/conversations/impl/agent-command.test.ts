@@ -155,6 +155,24 @@ describe('buildAgentCommand', () => {
     });
   });
 
+  it('puts Kilo auto-approve after the run subcommand for file prompts', () => {
+    const command = buildAgentCommand({
+      providerId: 'kilocode',
+      providerConfig: providerConfigDefaults.kilocode,
+      autoApprove: true,
+      extraInitialArgs: ['run', '--file', '/tmp/context.md', 'Analyze this issue'],
+      sessionId: 'session-1',
+    });
+
+    expect(command.args).toEqual([
+      'run',
+      '--auto',
+      '--file',
+      '/tmp/context.md',
+      'Analyze this issue',
+    ]);
+  });
+
   it.each<{
     providerId: AgentProviderId;
     expectedArgs: string[];

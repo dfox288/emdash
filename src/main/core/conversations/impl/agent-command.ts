@@ -137,6 +137,19 @@ function injectKimiHooksIntoInlineConfig(args: string[]): string[] {
   });
 }
 
+function appendAutoApproveArgs(
+  args: string[],
+  providerId: AgentProviderId,
+  autoApproveArgs: string[]
+): void {
+  if (providerId === 'kilocode' && args[0] === 'run') {
+    args.splice(1, 0, ...autoApproveArgs);
+    return;
+  }
+
+  args.push(...autoApproveArgs);
+}
+
 export function buildAgentCommand({
   providerId,
   providerConfig,
@@ -193,8 +206,13 @@ export function buildAgentCommand({
     autoApproveFlag &&
     // Kimi preserves approval settings on resume and rejects --yolo with --continue/--session.
     !(providerId === 'kimi' && isResuming);
+  const shouldDeferAutoApproveFlag =
+    shouldAppendAutoApproveFlag &&
+    providerId === 'kilocode' &&
+    !isResuming &&
+    extraInitialArgs?.[0] === 'run';
 
-  if (shouldAppendAutoApproveFlag) {
+  if (shouldAppendAutoApproveFlag && !shouldDeferAutoApproveFlag) {
     args.push(...parseArgField(autoApproveFlag));
   }
 
@@ -207,6 +225,10 @@ export function buildAgentCommand({
     !providerDef?.initialPromptViaStdinPipe
   ) {
     args.push(...parseArgField(initialPromptFlag), initialPrompt);
+  }
+
+  if (shouldDeferAutoApproveFlag) {
+    appendAutoApproveArgs(args, providerId, parseArgField(autoApproveFlag));
   }
 
   args.push(...parseArgField(providerConfig?.extraArgs));

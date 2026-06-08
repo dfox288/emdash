@@ -21,6 +21,11 @@ import type { Conversation } from '@shared/core/conversations/conversations';
 import { makePtySessionId } from '@shared/core/pty/ptySessionId';
 import { buildAgentSessionCommand } from './agent-command';
 import { createInitialPromptDelivery } from './initial-prompt-delivery';
+import {
+  buildInitialPromptFileDelivery,
+  shouldUseInitialPromptFile,
+  writeRemoteInitialPromptFile,
+} from './initial-prompt-file';
 import { scheduleInitialPromptInjection } from './keystroke-injection';
 import { resolveProviderEnv } from './provider-env';
 
@@ -107,11 +112,12 @@ export class SshConversationProvider implements ConversationProvider {
     if (!spawnToken) return;
 
     try {
+      const remoteFs = new SshFileSystem(this.proxy, '/');
       await workspaceTrustService.maybeAutoTrustSsh({
         providerId: conversation.providerId,
         cwd: this.taskPath,
         ctx: this.ctx,
-        remoteFs: new SshFileSystem(this.proxy, '/'),
+        remoteFs,
         force: conversation.autoApprove === true,
       });
 
@@ -119,19 +125,37 @@ export class SshConversationProvider implements ConversationProvider {
       const agentSession = resolveAgentSessionCommandArgs(conversation, isResuming, {
         requireProviderSessionId: false,
       });
-      const initialPromptDelivery = createInitialPromptDelivery({
-        providerId: conversation.providerId,
-        conversationId: conversation.id,
-        providerConfig,
-        initialPrompt,
-        isResuming: agentSession.isResuming,
-      });
+      const remoteShellProfile = await this.proxy.getRemoteShellProfile();
+      const usePromptFile =
+        conversation.providerId === 'kilocode' || shouldUseInitialPromptFile(initialPrompt);
+      const fileDelivery =
+        !agentSession.isResuming && initialPrompt?.trim() && usePromptFile
+          ? buildInitialPromptFileDelivery({
+              providerId: conversation.providerId,
+              filePath: await writeRemoteInitialPromptFile({
+                conversationId: conversation.id,
+                prompt: initialPrompt ?? '',
+                fs: remoteFs,
+                remoteHome: remoteShellProfile.env.HOME ?? '',
+              }),
+            })
+          : undefined;
+      const deliveredPrompt = fileDelivery?.prompt ?? initialPrompt;
+      const initialPromptDelivery = fileDelivery?.extraInitialArgs
+        ? undefined
+        : createInitialPromptDelivery({
+            providerId: conversation.providerId,
+            conversationId: conversation.id,
+            providerConfig,
+            initialPrompt: deliveredPrompt,
+            isResuming: agentSession.isResuming,
+          });
       const { command, args } = buildAgentSessionCommand({
         providerId: conversation.providerId,
         providerConfig,
         autoApprove: conversation.autoApprove,
-        extraInitialArgs: initialPromptDelivery.argvAddition(),
-        initialPrompt,
+        extraInitialArgs: fileDelivery?.extraInitialArgs ?? initialPromptDelivery?.argvAddition(),
+        initialPrompt: fileDelivery?.extraInitialArgs ? undefined : deliveredPrompt,
         sessionId: agentSession.sessionId,
         providerSessionId: conversation.providerSessionId,
         isResuming: agentSession.isResuming,
@@ -156,12 +180,11 @@ export class SshConversationProvider implements ConversationProvider {
         resume: agentSession.isResuming,
       };
 
-      const profile = await this.proxy.getRemoteShellProfile();
       const sshCommand = resolveSshCommand(
         'agent',
         cfg,
         { ...providerEnv, ...this.taskEnvVars },
-        profile
+        remoteShellProfile
       );
 
       const result = await openSsh2Pty(this.proxy, {
@@ -271,7 +294,7 @@ export class SshConversationProvider implements ConversationProvider {
       scheduleInitialPromptInjection({
         pty,
         conversation,
-        initialPrompt,
+        initialPrompt: deliveredPrompt,
         isResuming: agentSession.isResuming,
       });
       telemetryService.capture('agent_run_started', {

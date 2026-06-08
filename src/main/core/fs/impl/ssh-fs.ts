@@ -474,6 +474,16 @@ export class SshFileSystem implements FileSystemProvider {
     }
   }
 
+  async chmod(path: string, mode: number): Promise<void> {
+    const fullPath = this.resolveRemotePath(path);
+    const sftp = await this.getSftp();
+    await new Promise<void>((resolve, reject) => {
+      sftp.chmod(fullPath, mode, (err) =>
+        err ? reject(this.mapSftpError(err, fullPath)) : resolve()
+      );
+    });
+  }
+
   async realPath(path: string): Promise<string> {
     const fullPath = this.resolveRemotePath(path);
     const result = await this.exec(`realpath ${quoteShellArg(fullPath)}`);

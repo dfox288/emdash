@@ -28,6 +28,11 @@ import { makePtySessionId } from '@shared/core/pty/ptySessionId';
 import { buildAgentSessionCommand } from './agent-command';
 import { syncGrokThemeWithAppTheme } from './grok-theme-config';
 import { createInitialPromptDelivery } from './initial-prompt-delivery';
+import {
+  buildInitialPromptFileDelivery,
+  shouldUseInitialPromptFile,
+  writeLocalInitialPromptFile,
+} from './initial-prompt-file';
 import { scheduleInitialPromptInjection } from './keystroke-injection';
 import { resolveProviderEnv } from './provider-env';
 
@@ -128,19 +133,34 @@ export class LocalConversationProvider implements ConversationProvider {
       const providerConfig = await providerOverrideSettings.getItem(conversation.providerId);
       const providerDef = getProvider(conversation.providerId);
       const agentSession = resolveAgentSessionCommandArgs(conversation, isResuming);
-      const initialPromptDelivery = createInitialPromptDelivery({
-        providerId: conversation.providerId,
-        conversationId: conversation.id,
-        providerConfig,
-        initialPrompt,
-        isResuming: agentSession.isResuming,
-      });
+      const usePromptFile =
+        conversation.providerId === 'kilocode' || shouldUseInitialPromptFile(initialPrompt);
+      const fileDelivery =
+        !agentSession.isResuming && initialPrompt?.trim() && usePromptFile
+          ? buildInitialPromptFileDelivery({
+              providerId: conversation.providerId,
+              filePath: await writeLocalInitialPromptFile({
+                conversationId: conversation.id,
+                prompt: initialPrompt ?? '',
+              }),
+            })
+          : undefined;
+      const deliveredPrompt = fileDelivery?.prompt ?? initialPrompt;
+      const initialPromptDelivery = fileDelivery?.extraInitialArgs
+        ? undefined
+        : createInitialPromptDelivery({
+            providerId: conversation.providerId,
+            conversationId: conversation.id,
+            providerConfig,
+            initialPrompt: deliveredPrompt,
+            isResuming: agentSession.isResuming,
+          });
       const { command, args } = buildAgentSessionCommand({
         providerId: conversation.providerId,
         providerConfig,
         autoApprove: conversation.autoApprove,
-        extraInitialArgs: initialPromptDelivery.argvAddition(),
-        initialPrompt,
+        extraInitialArgs: fileDelivery?.extraInitialArgs ?? initialPromptDelivery?.argvAddition(),
+        initialPrompt: fileDelivery?.extraInitialArgs ? undefined : deliveredPrompt,
         sessionId: agentSession.sessionId,
         providerSessionId: conversation.providerSessionId,
         isResuming: agentSession.isResuming,
@@ -273,7 +293,7 @@ export class LocalConversationProvider implements ConversationProvider {
       scheduleInitialPromptInjection({
         pty,
         conversation,
-        initialPrompt,
+        initialPrompt: deliveredPrompt,
         isResuming: agentSession.isResuming,
       });
       telemetryService.capture('agent_run_started', {
