@@ -15,6 +15,7 @@ import { gitWorktreeUpdateChannel } from '@shared/core/git/events';
 import { prSyncProgressChannel, prUpdatedChannel } from '@shared/core/pull-requests/prEvents';
 import {
   lifecycleScriptStatusChannel,
+  taskArchivedChannel,
   taskCreatedChannel,
   taskProvisionProgressChannel,
   taskProvisionedChannel,
@@ -110,6 +111,7 @@ export class TaskManagerStore {
   private _provisionPromises = new Map<string, Promise<void>>();
 
   private _unsubTaskCreated: (() => void) | null = null;
+  private _unsubTaskArchived: (() => void) | null = null;
   private _unsubPrUpdated: (() => void) | null = null;
   private _unsubPrSyncProgress: (() => void) | null = null;
   private _unsubGitWorktreeUpdate: (() => void) | null = null;
@@ -142,6 +144,28 @@ export class TaskManagerStore {
         terminalRegistry.acquire(task.id, this.projectId);
       });
     });
+
+    this._unsubTaskArchived = events.on(
+      taskArchivedChannel,
+      ({ taskId, projectId: evtProjectId }) => {
+        if (evtProjectId !== this.projectId) return;
+        const task = this.tasks.get(taskId);
+        // Idempotent: GUI-initiated archives already updated the store
+        // optimistically (archivedAt set) before this event arrives. Only
+        // headless archives (automations, inbound MCP) take this path.
+        if (!task || !isRegistered(task) || task.data.archivedAt) return;
+        runInAction(() => {
+          task.data.archivedAt = new Date().toISOString();
+        });
+        this._releaseTaskRegistries(taskId);
+        runInAction(() => {
+          const current = this.tasks.get(taskId);
+          if (current && isRegistered(current)) {
+            current.transitionToDryUnprovisioned({ ...current.data }, 'idle');
+          }
+        });
+      }
+    );
 
     this._unsubStatusUpdated = events.on(
       taskStatusUpdatedChannel,
@@ -653,6 +677,8 @@ export class TaskManagerStore {
   dispose(): void {
     this._unsubTaskCreated?.();
     this._unsubTaskCreated = null;
+    this._unsubTaskArchived?.();
+    this._unsubTaskArchived = null;
     this._unsubPrUpdated?.();
     this._unsubPrUpdated = null;
     this._unsubPrSyncProgress?.();
