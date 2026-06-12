@@ -22,6 +22,7 @@ import { editorBufferService } from './core/editor/editor-buffer-service';
 import { githubAccountReconciliationService } from './core/github/accounts/github-account-reconciliation-instance';
 import { githubAccountRegistry } from './core/github/accounts/github-account-registry-instance';
 import { GitHubAuthServerAdapter } from './core/github/accounts/github-auth-server-adapter';
+import { mcpServerService } from './core/mcp-server/service';
 import { projectManager } from './core/projects/project-manager';
 import { projectSettingsService } from './core/projects/settings/project-settings-service';
 import { promptLibraryService } from './core/prompt-library/service';
@@ -142,6 +143,10 @@ void app.whenReady().then(async () => {
     log.error('Failed to start agent event service:', e);
   });
 
+  mcpServerService.initialize().catch((e) => {
+    log.error('Failed to start inbound MCP server:', e);
+  });
+
   emdashAccountService
     .initialize()
     .then((result) => {
@@ -194,6 +199,7 @@ app.on('before-quit', (event) => {
   void telemetryService.dispose().finally(() => {
     automationsService.stop();
     agentHookService.dispose();
+    mcpServerService.dispose();
     stopResourceSampler();
     updateService.dispose();
     prSyncScheduler.dispose();
