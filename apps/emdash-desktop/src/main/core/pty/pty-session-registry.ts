@@ -143,6 +143,16 @@ export class PtySessionRegistry {
     this.activeConsumers.delete(sessionId);
   }
 
+  /**
+   * Read-only snapshot of a session's ring buffer WITHOUT registering an
+   * IPC consumer (unlike `subscribe`). Used by the inbound MCP server's
+   * lane-output tool, where every call registering a consumer would leak
+   * entries into `activeConsumers`. Returns undefined when no buffer exists.
+   */
+  peek(sessionId: string): string | undefined {
+    return this.ringBuffers.get(sessionId);
+  }
+
   getMetadata(sessionId: string): PtySessionMetadata | undefined {
     return this.metadata.get(sessionId);
   }

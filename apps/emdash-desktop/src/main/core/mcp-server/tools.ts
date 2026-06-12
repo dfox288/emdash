@@ -7,6 +7,9 @@
  *                          see automations/actions/taskCreate.ts)
  *   emdash_lane_status   → getTasks + getConversationsForTask (agentStatus)
  *   emdash_lane_diff     → workspace git provider (getFullStatus / getFileDiff)
+ *   emdash_lane_output   → ptySessionRegistry.peek (read-only ring buffer)
+ *   emdash_lane_send     → pty.write via buildPromptInjectionPayload (follow-up prompt)
+ *   emdash_lane_archive  → taskService.archiveTask (archives + tears down worktree)
  *
  * No business logic lives here — every tool validates args and calls existing
  * operations. Runtime deps are imported lazily inside the handlers so that
@@ -16,9 +19,12 @@
 import { randomUUID } from 'node:crypto';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { getProvider } from '@shared/core/agents/agent-provider-registry';
 import type { Conversation } from '@shared/core/conversations/conversations';
 import type { Branch, BranchesPayload, DiffResult } from '@shared/core/git/git';
+import { makePtySessionId } from '@shared/core/pty/ptySessionId';
 import { buildWorkspaceConfigFromPreset } from '@shared/core/workspaces/build-workspace-config-from-preset';
+import { buildPromptInjectionPayload } from '@shared/prompt-injection';
 
 // ─── Reply helpers ──────────────────────────────────────────────────────────
 
@@ -77,6 +83,58 @@ function deriveAgentActivity(conversations: Conversation[]): AgentActivity {
   if (statuses.includes('error')) return 'error';
   if (statuses.includes('completed')) return 'completed';
   return statuses.length === 0 ? 'none' : 'idle';
+}
+
+/**
+ * Resolves the conversation a lane tool should target: an explicit
+ * conversationId when given, otherwise the lane's initial conversation,
+ * falling back to the first one.
+ */
+async function resolveLaneConversation(
+  taskId: string,
+  conversationId?: string
+): Promise<
+  | {
+      ok: true;
+      task: NonNullable<Awaited<ReturnType<typeof findTask>>>;
+      conversation: Conversation;
+    }
+  | { ok: false; reply: ToolReply }
+> {
+  const task = await findTask(taskId);
+  if (!task) return { ok: false, reply: fail('task_not_found', `Task not found: ${taskId}`) };
+
+  const { getConversationsForTask } =
+    await import('@main/core/conversations/getConversationsForTask');
+  const conversations = await getConversationsForTask(task.projectId, task.id);
+  const conversation = conversationId
+    ? conversations.find((c) => c.id === conversationId)
+    : (conversations.find((c) => c.isInitialConversation) ?? conversations[0]);
+  if (!conversation) {
+    return {
+      ok: false,
+      reply: fail(
+        'conversation_not_found',
+        conversationId
+          ? `Conversation not found on this lane: ${conversationId}`
+          : `Lane has no conversations: ${taskId}`
+      ),
+    };
+  }
+  return { ok: true, task, conversation };
+}
+
+// Covers CSI sequences, OSC sequences (BEL- or ST-terminated), and bare
+// single-character escapes — enough to make TUI output readable for an LLM.
+const ANSI_PATTERN = new RegExp(
+  ['\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)', '\\x1b\\[[0-9;?]*[ -/]*[@-~]', '\\x1b[@-_]'].join(
+    '|'
+  ),
+  'g'
+);
+
+function stripAnsi(text: string): string {
+  return text.replace(ANSI_PATTERN, '');
 }
 
 function renderUnifiedDiff(diff: DiffResult): string {
@@ -311,6 +369,149 @@ export function registerLaneTools(server: McpServer): void {
       } catch (error) {
         return fail('git_error', 'Reading the diff failed.', String(error));
       }
+    }
+  );
+
+  // emdash_lane_output ──────────────────────────────────────────────────────
+  const laneOutputInput = {
+    taskId: z.string().describe('Task id returned by emdash_create_lane.'),
+    conversationId: z
+      .string()
+      .optional()
+      .describe('Target conversation; defaults to the lane\u2019s initial conversation.'),
+    tail: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe('Return only the last N characters (after ANSI stripping). Default 10000.'),
+    raw: z
+      .boolean()
+      .optional()
+      .describe('Return raw terminal bytes including ANSI escape sequences. Default false.'),
+  };
+  server.registerTool(
+    'emdash_lane_output',
+    {
+      title: 'Lane output',
+      description:
+        'Read the recent terminal output of a lane\u2019s agent session (bounded 64 KB ring ' +
+        'buffer, read-only). ANSI escape sequences are stripped unless raw is set.',
+      inputSchema: laneOutputInput,
+    },
+    async (args): Promise<ToolReply> => {
+      const resolved = await resolveLaneConversation(args.taskId, args.conversationId);
+      if (!resolved.ok) return resolved.reply;
+      const { task, conversation } = resolved;
+
+      const { ptySessionRegistry } = await import('@main/core/pty/pty-session-registry');
+      const sessionId = makePtySessionId(task.projectId, task.id, conversation.id);
+      const buffer = ptySessionRegistry.peek(sessionId);
+      const running = ptySessionRegistry.get(sessionId) !== undefined;
+      if (buffer === undefined) {
+        return fail(
+          'no_session_output',
+          'No terminal buffer for this conversation \u2014 the agent session is not running ' +
+            '(sessions do not survive app restarts).',
+          { conversationId: conversation.id, running }
+        );
+      }
+
+      const text = args.raw ? buffer : stripAnsi(buffer);
+      const tail = args.tail ?? 10_000;
+      return ok({
+        taskId: args.taskId,
+        conversationId: conversation.id,
+        running,
+        truncated: text.length > tail,
+        output: text.slice(-tail),
+      });
+    }
+  );
+
+  // emdash_lane_send ────────────────────────────────────────────────────────
+  const laneSendInput = {
+    taskId: z.string().describe('Task id returned by emdash_create_lane.'),
+    prompt: z.string().min(1).describe('Follow-up prompt to submit to the running agent.'),
+    conversationId: z
+      .string()
+      .optional()
+      .describe('Target conversation; defaults to the lane\u2019s initial conversation.'),
+  };
+  server.registerTool(
+    'emdash_lane_send',
+    {
+      title: 'Send follow-up to lane',
+      description:
+        'Submit a follow-up prompt to the running agent of a lane (e.g. review feedback on the ' +
+        'same issue). Fails when the agent session is not running. For new issues create a new ' +
+        'lane instead of reusing one.',
+      inputSchema: laneSendInput,
+    },
+    async (args): Promise<ToolReply> => {
+      const resolved = await resolveLaneConversation(args.taskId, args.conversationId);
+      if (!resolved.ok) return resolved.reply;
+      const { task, conversation } = resolved;
+
+      const { ptySessionRegistry } = await import('@main/core/pty/pty-session-registry');
+      const sessionId = makePtySessionId(task.projectId, task.id, conversation.id);
+      const pty = ptySessionRegistry.get(sessionId);
+      if (!pty) {
+        return fail(
+          'lane_not_running',
+          'The agent session is not running (sessions do not survive app restarts).',
+          { conversationId: conversation.id }
+        );
+      }
+
+      // Same payload mechanics the initial-prompt delivery uses (see
+      // conversations/impl/initial-prompt-delivery.ts), but ALWAYS with a
+      // pause before the submit sequence: TUIs swallow a same-write Enter
+      // while still processing the pasted text (verified with claude).
+      const payload = buildPromptInjectionPayload({
+        providerId: conversation.providerId,
+        text: args.prompt,
+      });
+      const provider = getProvider(conversation.providerId);
+      const submitSequence = provider?.keystrokeSubmitSequence ?? '\r';
+      const submitDelayMs = provider?.keystrokeSubmitDelayMs ?? 150;
+      pty.write(payload);
+      await new Promise((resolve) => setTimeout(resolve, submitDelayMs));
+      pty.write(submitSequence);
+
+      return ok({
+        taskId: args.taskId,
+        conversationId: conversation.id,
+        sent: true,
+        chars: args.prompt.length,
+      });
+    }
+  );
+
+  // emdash_lane_archive ─────────────────────────────────────────────────────
+  const laneArchiveInput = {
+    taskId: z.string().describe('Task id returned by emdash_create_lane.'),
+  };
+  server.registerTool(
+    'emdash_lane_archive',
+    {
+      title: 'Archive lane',
+      description:
+        'Archive a finished lane: ends the agent session and removes the worktree when no other ' +
+        'task uses it (the branch survives). Reversible from the emdash UI. Call this only after ' +
+        'the result has been consumed (e.g. PR opened or merged).',
+      inputSchema: laneArchiveInput,
+    },
+    async (args): Promise<ToolReply> => {
+      const task = await findTask(args.taskId);
+      if (!task) return fail('task_not_found', `Task not found: ${args.taskId}`);
+      if (task.archivedAt) {
+        return ok({ taskId: task.id, archived: true, alreadyArchived: true });
+      }
+
+      const { taskService } = await import('@main/core/tasks/task-service');
+      await taskService.archiveTask(task.projectId, task.id);
+      return ok({ taskId: task.id, archived: true });
     }
   );
 }

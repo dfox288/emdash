@@ -2,6 +2,12 @@ import http from 'node:http';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { getConversationsForTask } from '@main/core/conversations/getConversationsForTask';
+import { ptySessionRegistry } from '@main/core/pty/pty-session-registry';
+import { getTasks } from '@main/core/tasks/operations/getTasks';
+import { taskService } from '@main/core/tasks/task-service';
+import type { Conversation } from '@shared/core/conversations/conversations';
+import type { Task } from '@shared/core/tasks/tasks';
 import { McpHttpServer } from './http-server';
 
 vi.mock('@main/lib/logger', () => ({
@@ -26,6 +32,48 @@ vi.mock('@main/core/projects/operations/getProjects', () => ({
 vi.mock('@main/core/tasks/operations/getTasks', () => ({
   getTasks: vi.fn(async () => []),
 }));
+
+vi.mock('@main/core/conversations/getConversationsForTask', () => ({
+  getConversationsForTask: vi.fn(async () => []),
+}));
+
+vi.mock('@main/core/pty/pty-session-registry', () => ({
+  ptySessionRegistry: { peek: vi.fn(), get: vi.fn() },
+}));
+
+vi.mock('@main/core/tasks/task-service', () => ({
+  taskService: { archiveTask: vi.fn(async () => undefined) },
+}));
+
+const mockGetTasks = vi.mocked(getTasks);
+const mockGetConversations = vi.mocked(getConversationsForTask);
+const mockPeek = vi.mocked(ptySessionRegistry.peek);
+const mockGetPty = vi.mocked(ptySessionRegistry.get);
+const mockArchiveTask = vi.mocked(taskService.archiveTask);
+
+const demoTask: Task = {
+  id: 'task-1',
+  projectId: 'project-1',
+  name: 'demo-lane',
+  status: 'in_progress',
+  createdAt: '2026-01-01T00:00:00Z',
+  updatedAt: '2026-01-01T00:00:00Z',
+  statusChangedAt: '2026-01-01T00:00:00Z',
+  isPinned: false,
+  prs: [],
+  conversations: {},
+  type: 'task',
+};
+
+const demoConversation: Conversation = {
+  id: 'conv-1',
+  projectId: 'project-1',
+  taskId: 'task-1',
+  providerId: 'claude',
+  title: 'demo-lane',
+  lastInteractedAt: null,
+  isInitialConversation: true,
+};
 
 const TOKEN = 'test-token-0123456789abcdef';
 
@@ -74,6 +122,11 @@ describe('McpHttpServer', () => {
   let port: number;
 
   beforeEach(async () => {
+    mockGetTasks.mockResolvedValue([]);
+    mockGetConversations.mockResolvedValue([]);
+    mockPeek.mockReturnValue(undefined);
+    mockGetPty.mockReturnValue(undefined);
+    mockArchiveTask.mockClear();
     server = new McpHttpServer();
     await server.start({ port: 0, token: TOKEN });
     port = server.getPort();
@@ -133,7 +186,10 @@ describe('McpHttpServer', () => {
         const names = tools.map((t) => t.name).sort();
         expect(names).toEqual([
           'emdash_create_lane',
+          'emdash_lane_archive',
           'emdash_lane_diff',
+          'emdash_lane_output',
+          'emdash_lane_send',
           'emdash_lane_status',
           'emdash_list_projects',
         ]);
@@ -194,6 +250,125 @@ describe('McpHttpServer', () => {
         expect(result.isError).toBe(true);
         const payload = JSON.parse(firstText(result));
         expect(payload.error).toBe('task_not_found');
+      } finally {
+        await client.close();
+      }
+    });
+  });
+
+  describe('lane output / send / archive', () => {
+    it('returns ANSI-stripped ring buffer output from emdash_lane_output', async () => {
+      mockGetTasks.mockResolvedValue([demoTask]);
+      mockGetConversations.mockResolvedValue([demoConversation]);
+      mockPeek.mockReturnValue('\x1b[31mhello\x1b[0m world\x1b]0;title\x07!');
+      mockGetPty.mockReturnValue({} as never);
+
+      const client = await connectClient(port, TOKEN);
+      try {
+        const result = await client.callTool({
+          name: 'emdash_lane_output',
+          arguments: { taskId: 'task-1' },
+        });
+        const payload = JSON.parse(firstText(result));
+        expect(payload).toMatchObject({
+          conversationId: 'conv-1',
+          running: true,
+          truncated: false,
+          output: 'hello world!',
+        });
+        expect(mockPeek).toHaveBeenCalledWith('project-1:task-1:conv-1');
+      } finally {
+        await client.close();
+      }
+    });
+
+    it('fails emdash_lane_output when no session buffer exists', async () => {
+      mockGetTasks.mockResolvedValue([demoTask]);
+      mockGetConversations.mockResolvedValue([demoConversation]);
+
+      const client = await connectClient(port, TOKEN);
+      try {
+        const result = await client.callTool({
+          name: 'emdash_lane_output',
+          arguments: { taskId: 'task-1' },
+        });
+        expect(result.isError).toBe(true);
+        expect(JSON.parse(firstText(result)).error).toBe('no_session_output');
+      } finally {
+        await client.close();
+      }
+    });
+
+    it('writes the prompt plus submit sequence via emdash_lane_send', async () => {
+      const write = vi.fn();
+      mockGetTasks.mockResolvedValue([demoTask]);
+      mockGetConversations.mockResolvedValue([demoConversation]);
+      mockGetPty.mockReturnValue({ write } as never);
+
+      const client = await connectClient(port, TOKEN);
+      try {
+        const result = await client.callTool({
+          name: 'emdash_lane_send',
+          arguments: { taskId: 'task-1', prompt: 'fix the review comments' },
+        });
+        const payload = JSON.parse(firstText(result));
+        expect(payload).toMatchObject({ sent: true, conversationId: 'conv-1' });
+        // Two writes: the pasted prompt, then — after a settle delay — the
+        // submit sequence (a same-write Enter gets swallowed by agent TUIs).
+        expect(write).toHaveBeenCalledTimes(2);
+        expect(write.mock.calls[0][0]).toContain('fix the review comments');
+        expect(write.mock.calls[1][0]).toBe('\r');
+      } finally {
+        await client.close();
+      }
+    });
+
+    it('fails emdash_lane_send when the session is not running', async () => {
+      mockGetTasks.mockResolvedValue([demoTask]);
+      mockGetConversations.mockResolvedValue([demoConversation]);
+
+      const client = await connectClient(port, TOKEN);
+      try {
+        const result = await client.callTool({
+          name: 'emdash_lane_send',
+          arguments: { taskId: 'task-1', prompt: 'hello' },
+        });
+        expect(result.isError).toBe(true);
+        expect(JSON.parse(firstText(result)).error).toBe('lane_not_running');
+      } finally {
+        await client.close();
+      }
+    });
+
+    it('archives a lane via emdash_lane_archive', async () => {
+      mockGetTasks.mockResolvedValue([demoTask]);
+
+      const client = await connectClient(port, TOKEN);
+      try {
+        const result = await client.callTool({
+          name: 'emdash_lane_archive',
+          arguments: { taskId: 'task-1' },
+        });
+        const payload = JSON.parse(firstText(result));
+        expect(payload).toMatchObject({ taskId: 'task-1', archived: true });
+        expect(mockArchiveTask).toHaveBeenCalledWith('project-1', 'task-1');
+      } finally {
+        await client.close();
+      }
+    });
+
+    it('is idempotent for already-archived lanes', async () => {
+      mockGetTasks.mockResolvedValue([{ ...demoTask, archivedAt: '2026-01-02T00:00:00Z' }]);
+
+      const client = await connectClient(port, TOKEN);
+      try {
+        const result = await client.callTool({
+          name: 'emdash_lane_archive',
+          arguments: { taskId: 'task-1' },
+        });
+        const payload = JSON.parse(firstText(result));
+        expect(payload).toMatchObject({ archived: true, alreadyArchived: true });
+        expect(mockArchiveTask).not.toHaveBeenCalled();
       } finally {
         await client.close();
       }
