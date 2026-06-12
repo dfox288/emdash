@@ -240,6 +240,28 @@ describe('McpHttpServer', () => {
       }
     });
 
+    it('includes prs and commits in emdash_lane_status', async () => {
+      mockGetTasks.mockResolvedValue([demoTask]);
+      mockGetConversations.mockResolvedValue([demoConversation]);
+
+      const client = await connectClient(port, TOKEN);
+      try {
+        const result = await client.callTool({
+          name: 'emdash_lane_status',
+          arguments: { taskId: 'task-1' },
+        });
+        const payload = JSON.parse(firstText(result));
+        expect(payload).toMatchObject({
+          taskId: 'task-1',
+          prs: [],
+          // No workspaceId on the demo task → commit lookup is skipped.
+          commits: null,
+        });
+      } finally {
+        await client.close();
+      }
+    });
+
     it('returns task_not_found from emdash_lane_status for unknown tasks', async () => {
       const client = await connectClient(port, TOKEN);
       try {

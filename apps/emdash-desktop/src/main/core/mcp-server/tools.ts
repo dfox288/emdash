@@ -286,8 +286,10 @@ export function registerLaneTools(server: McpServer): void {
     {
       title: 'Lane status',
       description:
-        'Get lane state: task lifecycle status plus derived agent activity ' +
-        '(working | needs_input | error | completed | idle | none).',
+        'Get lane state: task lifecycle status, derived agent activity ' +
+        '(working | needs_input | error | completed | idle | none), recent commits on the ' +
+        'lane branch, and PRs whose head is the lane branch. A change-lane is done when ' +
+        'activity is completed AND an open PR exists.',
       inputSchema: laneStatusInput,
     },
     async (args): Promise<ToolReply> => {
@@ -297,6 +299,27 @@ export function registerLaneTools(server: McpServer): void {
       const { getConversationsForTask } =
         await import('@main/core/conversations/getConversationsForTask');
       const conversations = await getConversationsForTask(task.projectId, task.id);
+
+      // Recent commits on the lane branch — the manager's "did the agent
+      // commit its work" check. Best-effort: null when the workspace is
+      // not mounted (e.g. after archive or before provisioning).
+      let commits: { hash: string; subject: string; isPushed: boolean }[] | null = null;
+      if (task.workspaceId) {
+        try {
+          const { resolveWorkspace } = await import('@main/core/projects/utils');
+          const env = resolveWorkspace(task.projectId, task.workspaceId);
+          if (env) {
+            const log = await env.git.getLog({ maxCount: 10 });
+            commits = log.commits.map((c) => ({
+              hash: c.hash.slice(0, 8),
+              subject: c.subject,
+              isPushed: c.isPushed,
+            }));
+          }
+        } catch {
+          commits = null;
+        }
+      }
 
       return ok({
         taskId: task.id,
@@ -310,6 +333,16 @@ export function registerLaneTools(server: McpServer): void {
           agentStatus: c.agentStatus ?? null,
           lastInteractedAt: c.lastInteractedAt,
         })),
+        // PRs whose head matches the lane branch, synced by emdash's PR engine.
+        prs: task.prs.map((pr) => ({
+          identifier: pr.identifier,
+          title: pr.title,
+          status: pr.status,
+          url: pr.url,
+          isDraft: pr.isDraft,
+          reviewDecision: pr.reviewDecision,
+        })),
+        commits,
       });
     }
   );
