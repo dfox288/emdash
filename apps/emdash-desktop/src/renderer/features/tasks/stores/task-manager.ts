@@ -154,15 +154,15 @@ export class TaskManagerStore {
         // optimistically (archivedAt set) before this event arrives. Only
         // headless archives (automations, inbound MCP) take this path.
         if (!task || !isRegistered(task) || task.data.archivedAt) return;
+        // Apply the whole archive mutation in one action so reactions never
+        // observe an intermediate state (archivedAt set but the store not yet
+        // transitioned). The GUI path is split into two actions only because
+        // it must await the RPC between them; this headless path is fully
+        // synchronous, so it can collapse them.
         runInAction(() => {
           task.data.archivedAt = new Date().toISOString();
-        });
-        this._releaseTaskRegistries(taskId);
-        runInAction(() => {
-          const current = this.tasks.get(taskId);
-          if (current && isRegistered(current)) {
-            current.transitionToDryUnprovisioned({ ...current.data }, 'idle');
-          }
+          this._releaseTaskRegistries(taskId);
+          task.transitionToDryUnprovisioned({ ...task.data }, 'idle');
         });
       }
     );

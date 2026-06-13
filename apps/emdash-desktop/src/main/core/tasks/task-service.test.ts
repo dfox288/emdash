@@ -66,4 +66,17 @@ describe('TaskService.archiveTask', () => {
 
     expect(order).toEqual(['archive-op', 'emit']);
   });
+
+  it('does not emit the archived event when the archive operation fails', async () => {
+    mockArchiveOp.mockRejectedValueOnce(new Error('db constraint violation'));
+
+    const service = new TaskService();
+    await expect(service.archiveTask('project-1', 'task-1')).rejects.toThrow(
+      'db constraint violation'
+    );
+
+    // An emitted event here would make every open window hide a task that is
+    // still alive in the database.
+    expect(mockEmit).not.toHaveBeenCalled();
+  });
 });
