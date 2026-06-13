@@ -1,5 +1,16 @@
 # MCP
 
+Emdash integrates with MCP in **two directions**:
+
+- **Outbound / consumer** (this document): emdash configures which external MCP
+  servers the *agents* it launches connect to.
+- **Inbound / server** (see [`mcp-server.md`](mcp-server.md)): emdash itself
+  exposes an MCP server so an external orchestrator agent can drive emdash
+  (create task lanes, read status/diffs, send follow-ups, archive). Off by
+  default.
+
+The two are independent subsystems (`core/mcp/` vs `core/mcp-server/`).
+
 ## Main Files
 
 - `src/main/core/mcp/services/McpService.ts`

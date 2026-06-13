@@ -128,6 +128,13 @@ export const browserSettingsSchema = z
 
 export const resourceMonitorSettingsSchema = z.object({ enabled: z.boolean() });
 
+export const mcpServerSettingsSchema = z.object({
+  enabled: z.boolean(),
+  // 0 = ephemeral (OS-assigned); otherwise a fixed loopback port so external
+  // MCP clients can be configured once.
+  port: z.number().int().min(0).max(65535),
+});
+
 export const openInSettingsSchema = z.object({
   default: openInAppIdSchema,
   hidden: z.array(openInAppIdSchema),
@@ -147,6 +154,7 @@ export const APP_SETTINGS_SCHEMA_MAP = {
   browserPreview: browserPreviewSettingsSchema,
   browser: browserSettingsSchema,
   resourceMonitor: resourceMonitorSettingsSchema,
+  mcpServer: mcpServerSettingsSchema,
   changesViewMode: changesViewModeSchema,
 } as const;
 
@@ -164,5 +172,6 @@ export const appSettingsSchema = z.object({
   browserPreview: browserPreviewSettingsSchema,
   browser: browserSettingsSchema,
   resourceMonitor: resourceMonitorSettingsSchema,
+  mcpServer: mcpServerSettingsSchema,
   changesViewMode: changesViewModeSchema,
 });

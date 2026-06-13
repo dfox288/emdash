@@ -17,6 +17,7 @@ import { gitlabController } from './core/gitlab/controller';
 import { issueController } from './core/issues/controller';
 import { jiraController } from './core/jira/controller';
 import { linearController } from './core/linear/controller';
+import { mcpServerController } from './core/mcp-server/controller';
 import { mcpController } from './core/mcp/controller';
 import { mondayController } from './core/monday/controller';
 import { plainController } from './core/plain/controller';
@@ -77,6 +78,7 @@ export const rpcRouter = createRPCRouter({
   conversations: conversationController,
   terminals: terminalsController,
   mcp: mcpController,
+  mcpServer: mcpServerController,
   telemetry: telemetryController,
   pullRequests: pullRequestController,
   viewState: viewStateController,

@@ -1,5 +1,6 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { MCP_SERVER_DEFAULT_PORT } from '@main/core/mcp-server/constants';
 import { DEFAULT_BROWSER_PROFILE_ID, DEFAULT_BROWSER_PROFILES } from '@shared/browser';
 import type { AppSettings, AppSettingsKey } from '@shared/core/app-settings';
 import { TERMINAL_FONT_SIZE_DEFAULT } from '@shared/core/terminals/terminal-settings';
@@ -71,6 +72,10 @@ export const SETTINGS_DEFAULTS = {
   },
   resourceMonitor: {
     enabled: false,
+  },
+  mcpServer: {
+    enabled: false,
+    port: MCP_SERVER_DEFAULT_PORT,
   },
   changesViewMode: {
     unstaged: 'flat' as const,
