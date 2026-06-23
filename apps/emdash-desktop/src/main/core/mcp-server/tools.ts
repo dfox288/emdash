@@ -6,7 +6,7 @@
  *                          createConversation      (the proven automations sequence,
  *                          see automations/actions/taskCreate.ts)
  *   emdash_lane_status   → getTasks + getConversationsForTask (agentStatus)
- *   emdash_lane_diff     → workspace git provider (getFullStatus / getFileDiff)
+ *   emdash_lane_diff     → workspace gitWorktree (getChangedFiles / getFileAtRef vs base)
  *   emdash_lane_output   → ptySessionRegistry.peek (read-only ring buffer)
  *   emdash_lane_send     → pty.write via buildPromptInjectionPayload (follow-up prompt)
  *   emdash_lane_archive  → taskService.archiveTask (archives + tears down worktree)
@@ -17,11 +17,11 @@
  * the database client.
  */
 import { randomUUID } from 'node:crypto';
+import type { GitBranchRef } from '@emdash/core/git';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { getProvider } from '@shared/core/agents/agent-provider-registry';
 import type { Conversation } from '@shared/core/conversations/conversations';
-import type { Branch, BranchesPayload, DiffResult } from '@shared/core/git/git';
 import { makePtySessionId } from '@shared/core/pty/ptySessionId';
 import { buildWorkspaceConfigFromPreset } from '@shared/core/workspaces/build-workspace-config-from-preset';
 import { buildPromptInjectionPayload } from '@shared/prompt-injection';
@@ -59,11 +59,14 @@ async function ensureProjectOpen(projectId: string) {
   return project ?? null;
 }
 
-function resolveDefaultBranch(payload: BranchesPayload): Branch | undefined {
-  const byName = (name: string | null) =>
-    payload.branches.find((b) => b.type === 'local' && b.branch === name) ??
-    payload.branches.find((b) => b.branch === name);
-  return byName(payload.gitDefaultBranch) ?? byName(payload.currentBranch);
+function resolveDefaultBranch(
+  branches: GitBranchRef[],
+  defaultName: string
+): GitBranchRef | undefined {
+  return (
+    branches.find((b) => b.type === 'local' && b.branch === defaultName) ??
+    branches.find((b) => b.branch === defaultName)
+  );
 }
 
 async function findTask(taskId: string) {
@@ -137,17 +140,6 @@ function stripAnsi(text: string): string {
   return text.replace(ANSI_PATTERN, '');
 }
 
-function renderUnifiedDiff(diff: DiffResult): string {
-  if (diff.isBinary) return '<binary file>';
-  return diff.lines
-    .map((line) => {
-      if (line.type === 'add') return `+${line.right ?? ''}`;
-      if (line.type === 'del') return `-${line.left ?? ''}`;
-      return ` ${line.left ?? line.right ?? ''}`;
-    })
-    .join('\n');
-}
-
 // ─── Tool registration ──────────────────────────────────────────────────────
 
 export function registerLaneTools(server: McpServer): void {
@@ -219,16 +211,14 @@ export function registerLaneTools(server: McpServer): void {
         return fail('project_not_found', `Project not found or failed to open: ${args.projectId}`);
       }
 
-      const branchesPayload = await project.repository.getBranchesPayload();
-      if (branchesPayload.isUnborn) {
-        return fail(
-          'initial_commit_required',
-          'The project repository has no commits yet — create an initial commit first.'
-        );
-      }
-      const defaultBranch = resolveDefaultBranch(branchesPayload);
+      const snapshot = await project.gitRepository.getSnapshot();
+      const defaultBranchName = await project.gitRepository.getDefaultBranch();
+      const defaultBranch = resolveDefaultBranch(snapshot.refs.value.branches, defaultBranchName);
       if (!defaultBranch) {
-        return fail('default_branch_not_found', 'Could not resolve a default branch to fork from.');
+        return fail(
+          'default_branch_not_found',
+          'Could not resolve a default branch to fork from — does the repository have an initial commit?'
+        );
       }
 
       const taskName = generateTaskName({ title: args.name ?? args.prompt });
@@ -309,7 +299,7 @@ export function registerLaneTools(server: McpServer): void {
           const { resolveWorkspace } = await import('@main/core/projects/utils');
           const env = resolveWorkspace(task.projectId, task.workspaceId);
           if (env) {
-            const log = await env.git.getLog({ maxCount: 10 });
+            const log = await env.gitWorktree.getLog({ maxCount: 10 });
             commits = log.commits.map((c) => ({
               hash: c.hash.slice(0, 8),
               subject: c.subject,
@@ -354,8 +344,8 @@ export function registerLaneTools(server: McpServer): void {
       .string()
       .optional()
       .describe(
-        'When set, return the unified diff for this file (relative to the worktree root). ' +
-          'Omit to get the change summary for the whole lane.'
+        'When set, return before/after content for this file (relative to the worktree root). ' +
+          'Omit to get the changed-file summary for the whole lane.'
       ),
   };
   server.registerTool(
@@ -363,8 +353,10 @@ export function registerLaneTools(server: McpServer): void {
     {
       title: 'Lane diff',
       description:
-        'Read the changes an agent produced in a lane. Without filePath: per-file change summary ' +
-        '(status, additions, deletions). With filePath: the unified diff of that file vs HEAD.',
+        'Read the changes an agent committed in a lane (the lane branch vs the base branch it ' +
+        'was forked from — i.e. what its PR contains). Without filePath: per-file change summary ' +
+        '(status, additions, deletions). With filePath: the file content before (base) and after ' +
+        '(lane HEAD).',
       inputSchema: laneDiffInput,
     },
     async (args): Promise<ToolReply> => {
@@ -381,23 +373,42 @@ export function registerLaneTools(server: McpServer): void {
       }
 
       try {
-        if (args.filePath) {
-          const diff = await env.git.getFileDiff(args.filePath);
-          return ok({
-            taskId: task.id,
-            filePath: args.filePath,
-            diff: renderUnifiedDiff(diff),
-          });
+        // The lane's committed work = changes between its branch HEAD and the
+        // base branch it was forked from (i.e. what its PR contains).
+        const { projectManager } = await import('@main/core/projects/project-manager');
+        const project = projectManager.getProject(task.projectId);
+        const head = await env.gitWorktree.getHead();
+        const headOid = head.kind === 'unborn' ? null : head.oid;
+        const baseBranch = project ? await project.gitRepository.getDefaultBranch() : null;
+        if (!headOid || !baseBranch) {
+          return fail(
+            'diff_unavailable',
+            'The lane has no commits yet, or its base branch could not be resolved.'
+          );
         }
 
-        const status = await env.git.getFullStatus();
+        if (args.filePath) {
+          // Before/after file content (base branch vs lane HEAD). Null means the
+          // file did not exist at that ref (added or deleted).
+          const before = await env.gitWorktree.getFileAtRef(args.filePath, baseBranch);
+          const after = await env.gitWorktree.getFileAtRef(args.filePath, headOid);
+          return ok({ taskId: task.id, filePath: args.filePath, base: baseBranch, before, after });
+        }
+
+        const changes = await env.gitWorktree.getChangedFiles({
+          base: { kind: 'branch', branch: { type: 'local', branch: baseBranch } },
+          head: { kind: 'commit', sha: headOid },
+        });
         return ok({
           taskId: task.id,
-          branch: status.currentBranch,
-          totalAdded: status.totalAdded,
-          totalDeleted: status.totalDeleted,
-          staged: status.staged,
-          unstaged: status.unstaged,
+          base: baseBranch,
+          head: head.kind === 'branch' ? head.name : headOid.slice(0, 8),
+          changes: changes.map((c) => ({
+            path: c.path,
+            status: c.status,
+            additions: c.additions,
+            deletions: c.deletions,
+          })),
         });
       } catch (error) {
         return fail('git_error', 'Reading the diff failed.', String(error));
